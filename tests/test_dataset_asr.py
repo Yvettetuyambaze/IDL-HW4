@@ -1,3 +1,4 @@
+import os
 from typing import Literal, Optional
 import torch
 
@@ -53,7 +54,7 @@ def test_asr_data_init(dataset):
 
         # Assert order alignment between the FBANK files and TRANSCRIPT files
         for fbank_file, text_file in zip(dataset.fbank_files, dataset.text_files):
-            assert fbank_file.split('.') == text_file.split('.'), \
+            assert os.path.basename(fbank_file) == os.path.basename(text_file), \
                 f"FBANK file {fbank_file} and TRANSCRIPT file {text_file} are misaligned."
         print("Test Passed: Order alignment between FBANK files and TRANSCRIPT files is correct.")
     
