@@ -107,10 +107,7 @@ class ASRDataset(Dataset):
             # Derive text_files directly from fbank_files by replacing the directory.
             # This guarantees perfect 1-to-1 alignment: each fbank file maps to the
             # transcript file with the identical basename in the text directory.
-            self.text_files = [
-                os.path.join(self.text_dir, os.path.basename(f))
-                for f in self.fbank_files
-            ]
+            self.text_files = sorted([os.path.join(self.text_dir, f) for f in os.listdir(self.text_dir))
 
             # Verify data alignment: lengths must match
             if len(self.fbank_files) != len(self.text_files):
