@@ -85,7 +85,15 @@ class DeterministicScoreFn:
         
         # For each item in batch
         for batch_idx in range(batch_size):
-            scores[batch_idx, -1, :] = self.update_scores(self.trees[batch_idx], x[batch_idx])
+            tree_idx = batch_idx
+            if batch_size > len(self.trees):
+                beam_width = getattr(self, 'beam_width', None)
+                if beam_width is not None and beam_width > 0:
+                    tree_idx = batch_idx // beam_width
+                else:
+                    tree_idx = batch_idx % len(self.trees)
+            tree_idx = min(tree_idx, len(self.trees) - 1)
+            scores[batch_idx, -1, :] = self.update_scores(self.trees[tree_idx], x[batch_idx])
         
         return scores[:, -1, :].log_softmax(dim=-1)
     

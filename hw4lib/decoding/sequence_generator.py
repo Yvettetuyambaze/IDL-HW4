@@ -213,78 +213,96 @@ class SequenceGenerator:
         batch_size, seq_len = x.shape
         device = x.device
 
-        # Process each batch item independently to avoid flattening issues
-        all_seqs = []
-        all_scores = []
+        # Allow auxiliary score_fn wrappers to know the beam width if needed
+        if hasattr(self.score_fn, '__dict__'):
+            try:
+                self.score_fn.beam_width = beam_width
+            except Exception:
+                pass
 
-        for b in range(batch_size):
-            # Initial sequence for this batch item
-            cur_x = x[b:b+1]                     # (1, seq_len)
-            # Expand to beam_width copies
-            beams = cur_x.repeat(beam_width, 1)   # (beam_width, seq_len)
-            scores = torch.zeros(beam_width, device=device)
-            finished = torch.zeros(beam_width, dtype=torch.bool, device=device)
+        # Initialize beams for each batch sample
+        beams = x.unsqueeze(1).repeat(1, beam_width, 1)  # (batch_size, beam_width, seq_len)
+        scores = torch.zeros(batch_size, beam_width, device=device)
+        finished = torch.zeros(batch_size, beam_width, dtype=torch.bool, device=device)
 
-            # First step
-            logits = self.score_fn(cur_x)         # (1, vocab_size)
+        # First expansion step
+        logits = self.score_fn(x)  # (batch_size, vocab_size)
+        if repeat_penalty != 1.0:
+            logits = self._apply_repeat_penalty(logits, x, repeat_penalty)
+        logits = logits / temperature
+        log_probs = torch.log_softmax(logits, dim=-1)
+        top_log_probs, top_tokens = torch.topk(log_probs, beam_width, dim=-1)
+        beams = torch.cat([beams, top_tokens.unsqueeze(-1)], dim=-1)
+        scores = top_log_probs
+        finished = finished | (top_tokens == self.tokenizer.eos_id)
+
+        # Remaining steps
+        for _ in range(self.max_length - seq_len - 1):
+            if finished.all():
+                break
+
+            current_len = beams.size(2)
+            flat_beams = beams.view(batch_size * beam_width, current_len)
+            logits = self.score_fn(flat_beams)  # (batch_size * beam_width, vocab_size)
             if repeat_penalty != 1.0:
-                logits = self._apply_repeat_penalty(logits, cur_x, repeat_penalty)
+                logits = self._apply_repeat_penalty(logits, flat_beams, repeat_penalty)
             logits = logits / temperature
-            log_probs = torch.log_softmax(logits, dim=-1)   # (1, vocab_size)
-            top_log_probs, top_tokens = torch.topk(log_probs[0], beam_width)
-            scores = top_log_probs
-            beams = torch.cat([beams, top_tokens.unsqueeze(1)], dim=1)
-            finished = finished | (top_tokens == self.tokenizer.eos_id)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            log_probs = log_probs.view(batch_size, beam_width, -1)
 
-            # Remaining steps
-            for _ in range(self.max_length - seq_len - 1):
-                if finished.all():
-                    break
-                # For each beam, compute logits (call score_fn with (1, L))
-                all_candidates = []
+            new_beams = []
+            new_scores = []
+            new_finished = []
+            vocab_size = log_probs.size(-1)
+
+            for b in range(batch_size):
+                if finished[b].all():
+                    new_beams.append(beams[b])
+                    new_scores.append(scores[b])
+                    new_finished.append(finished[b])
+                    continue
+
+                # Build candidate list for this batch item
+                candidates = []  # (score, beam_idx, token_id, is_finished)
                 for k in range(beam_width):
-                    prev_seq = beams[k]
-                    if finished[k]:
-                        # Preserve finished beams as candidates with unchanged score
-                        all_candidates.append((k, None, scores[k].item(), True))
+                    if finished[b, k]:
+                        candidates.append((scores[b, k].item(), k, -1, True))
                         continue
-                    seq = prev_seq.unsqueeze(0)            # (1, L)
-                    logits = self.score_fn(seq)            # (1, vocab_size)
-                    if repeat_penalty != 1.0:
-                        logits = self._apply_repeat_penalty(logits, seq, repeat_penalty)
-                    logits = logits / temperature
-                    log_probs = torch.log_softmax(logits, dim=-1)  # (1, vocab_size)
-                    cum_log_probs = scores[k] + log_probs[0]       # (vocab_size,)
-                    for token_id, score_val in enumerate(cum_log_probs):
-                        all_candidates.append((k, token_id, score_val.item(), False))
-                if not all_candidates:
-                    break
-                # Flatten all candidates and select the top beams
-                all_candidates.sort(key=lambda x: x[2], reverse=True)
-                top_candidates = all_candidates[:beam_width]
-                # Build new beams from selected candidates
-                new_beams = []
-                new_scores = []
-                new_finished = []
-                for k, token_id, score_val, is_finished in top_candidates:
-                    prev_seq = beams[k]
+                    for token_id in range(vocab_size):
+                        score_val = scores[b, k].item() + log_probs[b, k, token_id].item()
+                        candidates.append((score_val, k, token_id, False))
+
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                selected = candidates[:beam_width]
+
+                batch_beams = []
+                batch_scores = []
+                batch_finished = []
+                for score_val, beam_idx, token_id, is_finished in selected:
+                    prev_seq = beams[b, beam_idx]
                     if is_finished:
                         new_seq = prev_seq
                     else:
-                        new_seq = torch.cat([prev_seq, torch.tensor([token_id], device=device)])
-                    new_beams.append(new_seq)
-                    new_scores.append(score_val)
-                    new_finished.append(is_finished or finished[k] or (token_id == self.tokenizer.eos_id))
-                beams = torch.stack(new_beams)
-                scores = torch.tensor(new_scores, device=device)
-                finished = torch.tensor(new_finished, dtype=torch.bool, device=device)
+                        new_seq = torch.cat([prev_seq, torch.tensor([token_id], dtype=torch.long, device=device)])
+                    batch_beams.append(new_seq)
+                    batch_scores.append(score_val)
+                    batch_finished.append(is_finished or finished[b, beam_idx] or (token_id == self.tokenizer.eos_id))
 
-            # Sort beams by score descending
-            sort_idx = torch.argsort(scores, descending=True)
-            beams = beams[sort_idx]
-            scores = scores[sort_idx]
-            all_seqs.append(beams)
-            all_scores.append(scores)
+                new_beams.append(torch.stack(batch_beams))
+                new_scores.append(torch.tensor(batch_scores, device=device))
+                new_finished.append(torch.tensor(batch_finished, dtype=torch.bool, device=device))
+
+            beams = torch.stack(new_beams)
+            scores = torch.stack(new_scores)
+            finished = torch.stack(new_finished)
+
+        # Sort beams by score descending per batch
+        all_seqs = []
+        all_scores = []
+        for b in range(batch_size):
+            sort_idx = torch.argsort(scores[b], descending=True)
+            all_seqs.append(beams[b, sort_idx])
+            all_scores.append(scores[b, sort_idx])
 
         # Pad sequences to same length
         # all_seqs is a list (over batch) of tensors of shape (beam_width, seq_len).
